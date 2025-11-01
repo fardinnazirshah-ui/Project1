@@ -3,11 +3,9 @@
 # Independent Project - No Dependencies
 # ============================================================================
 # File: main.py (for Linear Regression project)
-# Status: ✓ Fully Tested & Verified - NO SYNTAX ERRORS
-
 """
 Economic Crisis Prediction - Logistic Regression Model
-Author: AI Research Team
+Author: Fardin
 Date: November 1, 2025
 Model: Logistic Regression (Standalone)
 Status: Production Ready
