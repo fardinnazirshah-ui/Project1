@@ -7,7 +7,7 @@
 
 """
 Economic Crisis Prediction - Random Forest Model
-Author: AI Research Team
+Author: Fardin
 Date: November 1, 2025
 Model: Random Forest Classifier (Standalone)
 Status: Production Ready
