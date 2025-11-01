@@ -148,8 +148,3 @@ On test set (typical):
 - **F1 Score**: 86.96%
 - **AUC-ROC**: 0.9992
 
----
-
-**Status**: ✓ Ready to Deploy
-**File**: [141] LR-Project-main.py
-**Tested**: Yes - NO SYNTAX ERRORS
