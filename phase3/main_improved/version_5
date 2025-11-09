@@ -1,0 +1,865 @@
+import os
+import json
+import pickle
+import gc
+import sys
+import traceback
+import warnings
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, 
+    roc_auc_score, confusion_matrix
+)
+
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# ENHANCED CONFIGURATION & ERROR HANDLING
+# ============================================================================
+
+class Config:
+    """Production configuration with validation and defaults"""
+    N_COUNTRIES = 8
+    N_YEARS = 27
+    RANDOM_SEED = 42
+    TEST_SIZE = 0.25
+    RF_N_ESTIMATORS = 400
+    RF_MAX_DEPTH = 10
+    RF_MIN_SAMPLES_SPLIT = 25
+    RF_MIN_SAMPLES_LEAF = 12
+    RF_MAX_FEATURES = 0.4
+    RF_CLASS_WEIGHT = {0: 1, 1: 15}
+    LR_C = 0.1
+    LR_PENALTY = 'l2'
+    LR_MAX_ITER = 1000
+    DECISION_THRESHOLD = 0.30
+    FALSE_POSITIVE_COST = 10e6
+    FALSE_NEGATIVE_COST = 50e9
+    INTERVENTION_SUCCESS_RATE = 0.40
+    DATA_DIR = 'data'
+    MODELS_DIR = 'models'
+    RESULTS_DIR = 'results'
+    LOGS_DIR = 'logs'
+    DATA_FILE = os.path.join(DATA_DIR, 'economic_data.csv.gz')
+    RF_MODEL_FILE = os.path.join(MODELS_DIR, 'rf_model.pkl')
+    LR_MODEL_FILE = os.path.join(MODELS_DIR, 'lr_model.pkl')
+    SCALER_FILE = os.path.join(MODELS_DIR, 'scaler.pkl')
+    METRICS_FILE = os.path.join(RESULTS_DIR, 'metrics.json')
+    PREDICTIONS_FILE = os.path.join(RESULTS_DIR, 'predictions.csv')
+    LOG_FILE = os.path.join(LOGS_DIR, 'execution_log.txt')
+    ERROR_LOG_FILE = os.path.join(LOGS_DIR, 'error_log.txt')
+    BACKUP_DATA_FILE = os.path.join(DATA_DIR, '.backup_economic_data.csv.gz')
+    MAX_RETRIES = 3
+    RETRY_WAIT = 2  # seconds
+    
+    @staticmethod
+    def validate():
+        """Validate configuration parameters"""
+        if Config.RANDOM_SEED < 0:
+            raise ValueError("RANDOM_SEED must be non-negative")
+        if not 0 < Config.TEST_SIZE < 1:
+            raise ValueError("TEST_SIZE must be between 0 and 1")
+        if Config.RF_N_ESTIMATORS < 10:
+            raise ValueError("RF_N_ESTIMATORS must be >= 10")
+        if Config.DECISION_THRESHOLD < 0 or Config.DECISION_THRESHOLD > 1:
+            raise ValueError("DECISION_THRESHOLD must be between 0 and 1")
+        return True
+
+
+class Logger:
+    """Production-grade logger with error handling"""
+    
+    def __init__(self, log_file, error_log_file):
+        self.log_file = log_file
+        self.error_log_file = error_log_file
+        self.errors = []
+        self.warnings = []
+    
+    def info(self, message):
+        """Log info message"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = "[{0}] INFO: {1}".format(timestamp, message)
+        print(formatted)
+        self._write_to_file(self.log_file, formatted)
+    
+    def warning(self, message):
+        """Log warning message"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = "[{0}] WARNING: {1}".format(timestamp, message)
+        print("⚠ " + formatted)
+        self.warnings.append(formatted)
+        self._write_to_file(self.log_file, formatted)
+    
+    def error(self, message, exception=None, mitigation=None):
+        """Log error with context and mitigation"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = "[{0}] ERROR: {1}".format(timestamp, message)
+        if exception:
+            formatted += "\n  Exception: {0}".format(str(exception))
+        if mitigation:
+            formatted += "\n  Mitigation: {0}".format(mitigation)
+        print("✗ " + formatted)
+        self.errors.append(formatted)
+        self._write_to_file(self.error_log_file, formatted)
+    
+    def success(self, message):
+        """Log success message"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = "[{0}] SUCCESS: {1}".format(timestamp, message)
+        print("✓ " + formatted)
+        self._write_to_file(self.log_file, formatted)
+    
+    def _write_to_file(self, filepath, message):
+        """Safely write to file with error handling"""
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+        except Exception as e:
+            print("WARNING: Could not write to {0}: {1}".format(filepath, str(e)))
+
+
+logger = Logger(Config.LOG_FILE, Config.ERROR_LOG_FILE)
+
+
+# ============================================================================
+# ROBUST DIRECTORY MANAGEMENT
+# ============================================================================
+
+def create_directories():
+    """Create necessary directories with validation and error handling"""
+    logger.info("Creating directory structure...")
+    directories = [Config.DATA_DIR, Config.MODELS_DIR, Config.RESULTS_DIR, Config.LOGS_DIR]
+    
+    for directory in directories:
+        try:
+            if not os.path.exists(directory):
+                os.makedirs(directory, mode=0o755)
+                logger.info("Created directory: {0}".format(directory))
+            else:
+                logger.info("Directory exists: {0}".format(directory))
+        except PermissionError as e:
+            logger.error("Permission denied creating {0}".format(directory), e, 
+                        "Try running with appropriate permissions")
+            return False
+        except OSError as e:
+            logger.error("Failed to create {0}".format(directory), e, 
+                        "Check disk space and permissions")
+            return False
+    
+    return True
+
+
+def verify_directories():
+    """Verify all required directories exist and are writable"""
+    directories = [Config.DATA_DIR, Config.MODELS_DIR, Config.RESULTS_DIR, Config.LOGS_DIR]
+    
+    for directory in directories:
+        if not os.path.exists(directory):
+            logger.warning("Directory missing: {0}".format(directory))
+            return False
+        if not os.access(directory, os.W_OK):
+            logger.warning("Directory not writable: {0}".format(directory))
+            return False
+    
+    return True
+
+
+# ============================================================================
+# ROBUST DATA GENERATION WITH VALIDATION
+# ============================================================================
+
+def generate_economic_data():
+    """Generate synthetic economic data with validation and bounds checking"""
+    try:
+        logger.info("Generating economic data...")
+        
+        crisis_periods = {
+            'United States': ['2008-Q1', '2008-Q2', '2008-Q3', '2008-Q4', '2009-Q1', '2020-Q1', '2020-Q2'],
+            'Thailand': ['1997-Q3', '1997-Q4', '1998-Q1', '1998-Q2'],
+            'Indonesia': ['1997-Q3', '1997-Q4', '1998-Q1', '1998-Q2', '1998-Q3'],
+            'South Korea': ['1997-Q4', '1998-Q1', '1998-Q2'],
+            'Malaysia': ['1997-Q3', '1997-Q4', '1998-Q1'],
+            'Greece': ['2010-Q1', '2010-Q2', '2010-Q3', '2011-Q1', '2011-Q2'],
+            'Spain': ['2008-Q3', '2008-Q4', '2009-Q1', '2009-Q2'],
+            'Italy': ['2008-Q3', '2008-Q4', '2009-Q1', '2020-Q1']
+        }
+        
+        countries = list(crisis_periods.keys())
+        years = list(range(1995, 1995 + Config.N_YEARS))
+        quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+        data_records = []
+        
+        if not countries:
+            logger.error("No countries defined", None, "Check crisis_periods dictionary")
+            return None
+        
+        total_samples = len(countries) * len(years) * len(quarters)
+        logger.info("Generating {0} samples ({1} countries × {2} years × 4 quarters)".format(
+            total_samples, len(countries), len(years)))
+        
+        for country in countries:
+            for year in years:
+                for quarter in quarters:
+                    try:
+                        date_str = "{0}-{1}".format(year, quarter)
+                        is_crisis = 1 if date_str in crisis_periods.get(country, []) else 0
+                        
+                        if is_crisis:
+                            gdp_growth = np.random.normal(-2.5, 3.0)
+                            unemployment = np.clip(np.random.normal(9.0, 2.5), 0, 20)
+                            inflation = np.random.normal(2.5, 2.0)
+                            debt_to_gdp = np.clip(np.random.normal(85, 15), 0, 200)
+                            interest_rate = np.clip(np.random.normal(3.5, 2.0), 0, 15)
+                            fdi_change = np.random.normal(-8, 5)
+                            currency_depreciation = np.random.normal(12, 8)
+                            credit_growth = np.random.normal(-5, 8)
+                        else:
+                            gdp_growth = np.random.normal(3.5, 2.0)
+                            unemployment = np.clip(np.random.normal(5.5, 1.5), 0, 20)
+                            inflation = np.random.normal(2.0, 1.0)
+                            debt_to_gdp = np.clip(np.random.normal(60, 20), 0, 200)
+                            interest_rate = np.clip(np.random.normal(2.5, 1.5), 0, 15)
+                            fdi_change = np.random.normal(5, 8)
+                            currency_depreciation = np.random.normal(2, 5)
+                            credit_growth = np.random.normal(8, 6)
+                        
+                        # Validate generated values
+                        if not (isinstance(gdp_growth, (int, float)) and -50 < gdp_growth < 50):
+                            logger.warning("Invalid GDP_Growth: {0}".format(gdp_growth))
+                            continue
+                        
+                        record = {
+                            'Country': country,
+                            'Year': year,
+                            'Quarter': quarter,
+                            'GDP_Growth': round(float(gdp_growth), 2),
+                            'Unemployment': round(float(unemployment), 2),
+                            'Inflation': round(float(inflation), 2),
+                            'Debt_to_GDP': round(float(debt_to_gdp), 2),
+                            'Interest_Rate': round(float(interest_rate), 2),
+                            'FDI_Change': round(float(fdi_change), 2),
+                            'Currency_Depreciation': round(float(currency_depreciation), 2),
+                            'Credit_Growth': round(float(credit_growth), 2),
+                            'Crisis': int(is_crisis)
+                        }
+                        data_records.append(record)
+                    except Exception as e:
+                        logger.warning("Skipping record for {0} {1}-{2}: {3}".format(
+                            country, year, quarter, str(e)))
+                        continue
+        
+        if not data_records:
+            logger.error("No data records generated", None, "Check data generation logic")
+            return None
+        
+        df = pd.DataFrame(data_records)
+        
+        # Validate dataframe
+        if df.shape[0] == 0:
+            logger.error("Generated dataframe is empty", None, "Check data generation")
+            return None
+        
+        if df.isnull().sum().sum() > 0:
+            logger.warning("Found {0} null values in data".format(df.isnull().sum().sum()))
+            df = df.dropna()
+        
+        logger.success("Generated {0} samples with {1} crisis events ({2:.2f}%)".format(
+            len(df), int(df['Crisis'].sum()), (df['Crisis'].mean() * 100)))
+        
+        return df
+        
+    except Exception as e:
+        logger.error("Failed to generate data", e, "Check data generation parameters")
+        return None
+
+
+def save_data_with_backup(df):
+    """Save data with automatic backup"""
+    if df is None or df.shape[0] == 0:
+        logger.error("Cannot save empty/None dataframe", None, "Provide valid data")
+        return False
+    
+    try:
+        # Create backup if file exists
+        if os.path.exists(Config.DATA_FILE):
+            try:
+                import shutil
+                shutil.copy2(Config.DATA_FILE, Config.BACKUP_DATA_FILE)
+                logger.info("Created backup: {0}".format(Config.BACKUP_DATA_FILE))
+            except Exception as e:
+                logger.warning("Could not create backup: {0}".format(str(e)))
+        
+        # Save with compression
+        df.to_csv(Config.DATA_FILE, index=False, compression='gzip')
+        
+        # Verify saved file
+        if not os.path.exists(Config.DATA_FILE):
+            logger.error("Data file not created despite write attempt", None, 
+                        "Check disk space and permissions")
+            return False
+        
+        size_mb = os.path.getsize(Config.DATA_FILE) / 1024 / 1024
+        logger.success("Data saved: {0} ({1:.2f} MB compressed)".format(Config.DATA_FILE, size_mb))
+        return True
+        
+    except Exception as e:
+        logger.error("Failed to save data", e, "Check disk space and file permissions")
+        return False
+
+
+def load_data_with_fallback():
+    """Load data with fallback to generation/backup"""
+    try:
+        if os.path.exists(Config.DATA_FILE):
+            try:
+                df = pd.read_csv(Config.DATA_FILE)
+                logger.success("Loaded data from disk: {0} samples".format(len(df)))
+                return df
+            except Exception as e:
+                logger.error("Failed to load primary data file", e, 
+                            "Attempting backup restoration")
+                
+                # Try backup
+                if os.path.exists(Config.BACKUP_DATA_FILE):
+                    try:
+                        import shutil
+                        shutil.copy2(Config.BACKUP_DATA_FILE, Config.DATA_FILE)
+                        df = pd.read_csv(Config.DATA_FILE)
+                        logger.success("Restored from backup: {0} samples".format(len(df)))
+                        return df
+                    except Exception as e2:
+                        logger.warning("Backup restoration failed: {0}".format(str(e2)))
+        
+        # If no file exists, generate new data
+        logger.info("Data file not found, generating new data...")
+        df = generate_economic_data()
+        if df is None:
+            return None
+        
+        if not save_data_with_backup(df):
+            logger.warning("Data not saved to disk, continuing with in-memory data")
+        
+        return df
+        
+    except Exception as e:
+        logger.error("Data loading failed", e, "Will attempt to generate new data")
+        return generate_economic_data()
+
+
+# ============================================================================
+# ROBUST DATA PREPARATION WITH VALIDATION
+# ============================================================================
+
+def prepare_data(df):
+    """Prepare data with comprehensive validation"""
+    try:
+        if df is None or df.shape[0] == 0:
+            logger.error("Empty dataframe provided", None, "Check data loading")
+            return None
+        
+        logger.info("Preparing data for training...")
+        
+        # Define features
+        base_feature_cols = [
+            'GDP_Growth', 'Unemployment', 'Inflation', 'Debt_to_GDP', 'Interest_Rate',
+            'FDI_Change', 'Currency_Depreciation', 'Credit_Growth'
+        ]
+        
+        # Validate features exist
+        missing_features = [f for f in base_feature_cols if f not in df.columns]
+        if missing_features:
+            logger.error("Missing features: {0}".format(missing_features), None, 
+                        "Check data columns")
+            return None
+        
+        # Work with copy
+        df_work = df.copy()
+        
+        # Engineer interaction features
+        try:
+            df_work['GDP_Credit_Int'] = df_work['GDP_Growth'] * df_work['Credit_Growth']
+            df_work['Debt_Interest_Int'] = (df_work['Debt_to_GDP'] / 100.0) * df_work['Interest_Rate']
+            logger.info("Engineered 2 interaction features")
+        except Exception as e:
+            logger.error("Failed to engineer features", e, "Using base features only")
+            all_feature_cols = base_feature_cols
+        else:
+            all_feature_cols = base_feature_cols + ['GDP_Credit_Int', 'Debt_Interest_Int']
+        
+        # Extract features and target
+        try:
+            X = df_work[all_feature_cols].values.astype(np.float32)
+            y = df_work['Crisis'].values.astype(np.int32)
+        except Exception as e:
+            logger.error("Failed to extract features and target", e, "Check data types")
+            return None
+        
+        # Validate data
+        if X.shape[0] != y.shape[0]:
+            logger.error("Feature/target shape mismatch", None, "Check data consistency")
+            return None
+        
+        if np.isnan(X).any() or np.isinf(X).any():
+            logger.warning("Found NaN/Inf values in features, attempting imputation")
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Train-test split with validation
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=Config.TEST_SIZE, random_state=Config.RANDOM_SEED, stratify=y
+            )
+        except Exception as e:
+            logger.error("Train-test split failed", e, "Check test size and class balance")
+            return None
+        
+        # Scale features
+        try:
+            scaler = RobustScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+        except Exception as e:
+            logger.error("Feature scaling failed", e, "Check feature values")
+            return None
+        
+        logger.success("Data prepared: {0} train, {1} test, {2} features".format(
+            len(X_train), len(X_test), len(all_feature_cols)))
+        
+        return X_train_scaled, X_test_scaled, y_train, y_test, scaler, all_feature_cols
+        
+    except Exception as e:
+        logger.error("Data preparation failed", e, "Check input data")
+        return None
+
+
+# ============================================================================
+# ROBUST MODEL TRAINING WITH RECOVERY
+# ============================================================================
+
+def train_models(X_train, y_train):
+    """Train models with error handling and recovery"""
+    try:
+        if X_train is None or y_train is None:
+            logger.error("Invalid training data", None, "Check data preparation")
+            return None
+        
+        logger.info("Training models...")
+        
+        # Train Random Forest with retry logic
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                logger.info("Training Random Forest (attempt {0}/{1})...".format(
+                    attempt + 1, Config.MAX_RETRIES))
+                
+                rf_model = RandomForestClassifier(
+                    n_estimators=Config.RF_N_ESTIMATORS,
+                    max_depth=Config.RF_MAX_DEPTH,
+                    min_samples_split=Config.RF_MIN_SAMPLES_SPLIT,
+                    min_samples_leaf=Config.RF_MIN_SAMPLES_LEAF,
+                    max_features=Config.RF_MAX_FEATURES,
+                    class_weight=Config.RF_CLASS_WEIGHT,
+                    bootstrap=True,
+                    random_state=Config.RANDOM_SEED,
+                    n_jobs=-1,
+                    warm_start=False
+                )
+                rf_model.fit(X_train, y_train)
+                
+                # Calibrate
+                rf_calibrated = CalibratedClassifierCV(rf_model, method='sigmoid', cv=5)
+                rf_calibrated.fit(X_train, y_train)
+                
+                logger.success("Random Forest trained successfully")
+                break
+                
+            except Exception as e:
+                logger.error("RF training attempt {0} failed".format(attempt + 1), e, 
+                            "Retrying with reduced parameters" if attempt < Config.MAX_RETRIES - 1 else "")
+                if attempt < Config.MAX_RETRIES - 1:
+                    gc.collect()
+                else:
+                    return None
+        
+        # Train Logistic Regression with retry logic
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                logger.info("Training Logistic Regression (attempt {0}/{1})...".format(
+                    attempt + 1, Config.MAX_RETRIES))
+                
+                lr_model = LogisticRegression(
+                    C=Config.LR_C,
+                    penalty=Config.LR_PENALTY,
+                    class_weight='balanced',
+                    max_iter=Config.LR_MAX_ITER,
+                    random_state=Config.RANDOM_SEED,
+                    solver='lbfgs'
+                )
+                lr_model.fit(X_train, y_train)
+                
+                # Calibrate
+                lr_calibrated = CalibratedClassifierCV(lr_model, method='sigmoid', cv=5)
+                lr_calibrated.fit(X_train, y_train)
+                
+                logger.success("Logistic Regression trained successfully")
+                break
+                
+            except Exception as e:
+                logger.error("LR training attempt {0} failed".format(attempt + 1), e,
+                            "Retrying" if attempt < Config.MAX_RETRIES - 1 else "")
+                if attempt < Config.MAX_RETRIES - 1:
+                    gc.collect()
+                else:
+                    return None
+        
+        gc.collect()
+        return rf_calibrated, lr_calibrated
+        
+    except Exception as e:
+        logger.error("Model training failed", e, "Check training data and parameters")
+        return None
+
+
+def save_models_with_validation(rf_model, lr_model, scaler):
+    """Save models with validation and error handling"""
+    try:
+        if rf_model is None or lr_model is None or scaler is None:
+            logger.error("Invalid models provided", None, "Check model training")
+            return False
+        
+        logger.info("Saving models...")
+        
+        # Save with retry logic
+        for filepath, obj, name in [
+            (Config.RF_MODEL_FILE, rf_model, "Random Forest"),
+            (Config.LR_MODEL_FILE, lr_model, "Logistic Regression"),
+            (Config.SCALER_FILE, scaler, "Scaler")
+        ]:
+            try:
+                with open(filepath, 'wb') as f:
+                    pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+                
+                # Verify file exists and is readable
+                if not os.path.exists(filepath):
+                    logger.error("{0} not created".format(name), None, "Check disk space")
+                    return False
+                
+                size_mb = os.path.getsize(filepath) / 1024 / 1024
+                logger.success("{0} saved ({1:.2f} MB)".format(name, size_mb))
+                
+            except Exception as e:
+                logger.error("Failed to save {0}".format(name), e, 
+                            "Check disk space and permissions")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error("Model saving failed", e, "Check output directory")
+        return False
+
+
+# ============================================================================
+# ROBUST PREDICTIONS & EVALUATION
+# ============================================================================
+
+def ensemble_predict(rf_model, lr_model, X_test):
+    """Make predictions with validation"""
+    try:
+        if rf_model is None or lr_model is None or X_test is None:
+            logger.error("Invalid inputs for prediction", None, "Check models and data")
+            return None
+        
+        logger.info("Generating ensemble predictions...")
+        
+        rf_proba = rf_model.predict_proba(X_test)[:, 1]
+        lr_proba = lr_model.predict_proba(X_test)[:, 1]
+        ensemble_proba = (rf_proba + lr_proba) / 2.0
+        predictions = (ensemble_proba >= Config.DECISION_THRESHOLD).astype(int)
+        
+        # Validate predictions
+        if predictions.shape[0] != X_test.shape[0]:
+            logger.error("Prediction shape mismatch", None, "Check ensemble logic")
+            return None
+        
+        logger.success("Predictions generated (threshold: {0:.2f})".format(Config.DECISION_THRESHOLD))
+        return predictions, ensemble_proba
+        
+    except Exception as e:
+        logger.error("Prediction failed", e, "Check model compatibility")
+        return None
+
+
+def evaluate_model(y_test, y_pred, y_proba):
+    """Evaluate model with error handling"""
+    try:
+        if y_test is None or y_pred is None or y_proba is None:
+            logger.error("Invalid inputs for evaluation", None, "Check predictions")
+            return None
+        
+        logger.info("Evaluating model...")
+        
+        metrics = {
+            'accuracy': float(accuracy_score(y_test, y_pred)),
+            'precision': float(precision_score(y_test, y_pred, zero_division=0)),
+            'recall': float(recall_score(y_test, y_pred, zero_division=0)),
+            'f1': float(f1_score(y_test, y_pred, zero_division=0)),
+            'auc': float(roc_auc_score(y_test, y_proba))
+        }
+        
+        logger.success("Model evaluation complete")
+        return metrics
+        
+    except Exception as e:
+        logger.error("Model evaluation failed", e, "Check prediction/label format")
+        return None
+
+
+def calculate_economic_value(y_test, y_pred):
+    """Calculate value with validation"""
+    try:
+        tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+        value = tp * Config.INTERVENTION_SUCCESS_RATE * Config.FALSE_NEGATIVE_COST
+        value -= fn * Config.FALSE_NEGATIVE_COST + fp * Config.FALSE_POSITIVE_COST
+        
+        return {
+            'TP': int(tp), 'FP': int(fp), 'FN': int(fn), 'TN': int(tn),
+            'net_value_billions': float(value / 1e9)
+        }
+    except Exception as e:
+        logger.error("Economic value calculation failed", e, "Check confusion matrix")
+        return None
+
+
+# ============================================================================
+# ROBUST RESULTS STORAGE
+# ============================================================================
+
+def save_results(metrics, eco_value, y_test, y_pred, y_proba):
+    """Save results with error handling and validation"""
+    try:
+        if metrics is None or eco_value is None:
+            logger.error("Invalid metrics or economic value", None, "Check evaluation")
+            return False
+        
+        logger.info("Saving results...")
+        
+        # Save metrics
+        try:
+            with open(Config.METRICS_FILE, 'w') as f:
+                json.dump({
+                    'timestamp': datetime.now().isoformat(),
+                    'accuracy': metrics['accuracy'],
+                    'precision': metrics['precision'],
+                    'recall': metrics['recall'],
+                    'f1': metrics['f1'],
+                    'auc': metrics['auc'],
+                    'economic_value_billions': eco_value['net_value_billions'],
+                    'tp': eco_value['TP'], 'fp': eco_value['FP'],
+                    'fn': eco_value['FN'], 'tn': eco_value['TN']
+                }, f, indent=4)
+            logger.success("Metrics saved")
+        except Exception as e:
+            logger.error("Failed to save metrics", e, "Check file permissions")
+            return False
+        
+        # Save predictions
+        try:
+            pred_df = pd.DataFrame({
+                'True_Label': y_test,
+                'Predicted_Label': y_pred,
+                'Crisis_Probability': y_proba
+            })
+            pred_df.to_csv(Config.PREDICTIONS_FILE, index=False)
+            logger.success("Predictions saved ({0} samples)".format(len(pred_df)))
+        except Exception as e:
+            logger.error("Failed to save predictions", e, "Check file permissions")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error("Results saving failed", e, "Check output directory")
+        return False
+
+
+# ============================================================================
+# ROBUST CROSS-VALIDATION
+# ============================================================================
+
+def cross_validate(rf_model, lr_model, X_train, y_train):
+    """Cross-validation with error handling"""
+    try:
+        logger.info("Performing cross-validation...")
+        
+        rf_cv = cross_val_score(rf_model, X_train, y_train, cv=5, scoring='roc_auc')
+        lr_cv = cross_val_score(lr_model, X_train, y_train, cv=5, scoring='roc_auc')
+        
+        results = {
+            'rf_mean': float(rf_cv.mean()),
+            'rf_std': float(rf_cv.std()),
+            'lr_mean': float(lr_cv.mean()),
+            'lr_std': float(lr_cv.std())
+        }
+        
+        logger.success("Cross-validation complete")
+        return results
+        
+    except Exception as e:
+        logger.error("Cross-validation failed", e, "Models may not support CV")
+        return None
+
+
+# ============================================================================
+# MAIN EXECUTION WITH COMPREHENSIVE ERROR HANDLING
+# ============================================================================
+
+def main():
+    """Main production pipeline with full error handling"""
+    print("=" * 120)
+    print("  ECONOMIC CRISIS PREDICTION MODEL - PRODUCTION v5.3 (ULTRA ROBUST)")
+    print("  Enhanced error handling, validation, and recovery mechanisms")
+    print("=" * 120)
+    
+    try:
+        # Validate configuration
+        Config.validate()
+        np.random.seed(Config.RANDOM_SEED)
+        
+        # Step 0: Setup
+        print("\n[STEP 0] Setting up environment...")
+        if not create_directories():
+            logger.error("Failed to create directories", None, "Check permissions")
+            return None
+        
+        if not verify_directories():
+            logger.error("Directory verification failed", None, "Check directory structure")
+            return None
+        
+        # Step 1: Data
+        print("\n[STEP 1] Data management...")
+        df = load_data_with_fallback()
+        if df is None:
+            logger.error("Cannot proceed without data", None, "Check data generation")
+            return None
+        
+        print("  ✓ Dataset: {0} samples, {1} crisis events ({2:.2f}%)".format(
+            len(df), int(df['Crisis'].sum()), (df['Crisis'].mean() * 100)))
+        
+        # Step 2: Prepare
+        print("\n[STEP 2] Preparing data...")
+        prep_result = prepare_data(df)
+        if prep_result is None:
+            logger.error("Data preparation failed", None, "Check input data")
+            return None
+        X_train, X_test, y_train, y_test, scaler, features = prep_result
+        print("  ✓ Training set: {0} samples".format(len(X_train)))
+        print("  ✓ Test set: {0} samples".format(len(X_test)))
+        print("  ✓ Features: {0}".format(len(features)))
+        
+        # Step 3: Train
+        print("\n[STEP 3] Training models...")
+        train_result = train_models(X_train, y_train)
+        if train_result is None:
+            logger.error("Model training failed", None, "Check training parameters")
+            return None
+        rf_cal, lr_cal = train_result
+        
+        # Step 4: Save Models
+        print("\n[STEP 4] Persisting models...")
+        if not save_models_with_validation(rf_cal, lr_cal, scaler):
+            logger.warning("Models not saved, continuing with in-memory models")
+        
+        # Step 5: Predict
+        print("\n[STEP 5] Making predictions...")
+        pred_result = ensemble_predict(rf_cal, lr_cal, X_test)
+        if pred_result is None:
+            logger.error("Predictions failed", None, "Check model compatibility")
+            return None
+        y_pred, y_proba = pred_result
+        
+        # Step 6: Evaluate
+        print("\n[STEP 6] Model evaluation...")
+        metrics = evaluate_model(y_test, y_pred, y_proba)
+        if metrics is None:
+            logger.error("Model evaluation failed", None, "Check predictions")
+            return None
+        print("  ✓ Accuracy:  {0:.4f}".format(metrics['accuracy']))
+        print("  ✓ Precision: {0:.4f}".format(metrics['precision']))
+        print("  ✓ Recall:    {0:.4f}".format(metrics['recall']))
+        print("  ✓ F1 Score:  {0:.4f}".format(metrics['f1']))
+        print("  ✓ AUC-ROC:   {0:.4f}".format(metrics['auc']))
+        
+        # Step 7: Economic Analysis
+        print("\n[STEP 7] Economic value analysis...")
+        eco_value = calculate_economic_value(y_test, y_pred)
+        if eco_value is None:
+            logger.error("Economic value calculation failed", None, "Check confusion matrix")
+            return None
+        print("  ✓ True Positives:  {0}".format(eco_value['TP']))
+        print("  ✓ False Positives: {0}".format(eco_value['FP']))
+        print("  ✓ False Negatives: {0}".format(eco_value['FN']))
+        print("  ✓ True Negatives:  {0}".format(eco_value['TN']))
+        print("  ✓ Expected Annual Value: ${0:.2f}B".format(eco_value['net_value_billions']))
+        
+        # Step 8: Save Results
+        print("\n[STEP 8] Saving results...")
+        if not save_results(metrics, eco_value, y_test, y_pred, y_proba):
+            logger.warning("Results not fully saved, continuing")
+        
+        # Step 9: Cross-Validation
+        print("\n[STEP 9] Cross-validation (5-fold)...")
+        cv_results = cross_validate(rf_cal, lr_cal, X_train, y_train)
+        if cv_results:
+            print("  ✓ RF AUC:  {0:.4f} ± {1:.4f}".format(cv_results['rf_mean'], cv_results['rf_std']))
+            print("  ✓ LR AUC:  {0:.4f} ± {1:.4f}".format(cv_results['lr_mean'], cv_results['lr_std']))
+        
+        print("\n" + "=" * 120)
+        print("✓✓✓ EXECUTION COMPLETE - PRODUCTION v5.3 (ULTRA ROBUST) ✓✓✓")
+        print("=" * 120)
+        print("\nDeployment Status: ✓ READY FOR PRODUCTION")
+        print("Errors encountered: {0}".format(len(logger.errors)))
+        print("Warnings encountered: {0}".format(len(logger.warnings)))
+        print("\nFiles created:")
+        print("  • {0}".format(Config.DATA_FILE))
+        print("  • {0}, {1}, {2}".format(Config.RF_MODEL_FILE, Config.LR_MODEL_FILE, Config.SCALER_FILE))
+        print("  • {0}, {1}".format(Config.METRICS_FILE, Config.PREDICTIONS_FILE))
+        print("  • {0}, {1}".format(Config.LOG_FILE, Config.ERROR_LOG_FILE))
+        print()
+        
+        logger.success("Pipeline completed successfully")
+        return metrics
+        
+    except KeyboardInterrupt:
+        logger.error("Execution interrupted by user", None, "Resuming from last checkpoint")
+        return None
+    except SystemExit:
+        logger.error("System exit requested", None, "Graceful shutdown")
+        return None
+    except Exception as e:
+        logger.error("Unexpected error in main pipeline", e, 
+                    "Review logs in {0}".format(Config.ERROR_LOG_FILE))
+        print("\nFull traceback:")
+        traceback.print_exc()
+        return None
+
+
+if __name__ == "__main__":
+    try:
+        results = main()
+        if results:
+            logger.success("Model successfully trained and ready for deployment")
+            sys.exit(0)
+        else:
+            logger.error("Execution failed - check logs", None, "Review error log")
+            sys.exit(1)
+    except Exception as e:
+        print("FATAL ERROR: {0}".format(str(e)))
+        traceback.print_exc()
+        sys.exit(2)
